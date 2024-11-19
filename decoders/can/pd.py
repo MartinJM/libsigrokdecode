@@ -20,12 +20,33 @@
 
 from common.srdhelper import bitpack_msb
 import sigrokdecode as srd
+import socket
+import struct
 
 class SamplerateError(Exception):
     pass
 
 def dlc2len(dlc):
     return [0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64][dlc]
+
+def build_can_frame(can_id, data):
+    # Format (from linux/can.h):
+    # struct can_frame {
+    #     canid_t can_id;  /* 32 bit CAN_ID + EFF/RTR/ERR flags */
+    #     union {
+    #     	/* CAN frame payload length in byte (0 .. CAN_MAX_DLEN)
+    #     	 * was previously named can_dlc so we need to carry that
+    #     	 * name for legacy support
+    #     	 */
+    #     	__u8 len;
+    #     	__u8 can_dlc; /* deprecated */
+    #     } __attribute__((packed)); /* disable padding added in some ABIs */
+    #     __u8 __pad; /* padding */
+    #     __u8 __res0; /* reserved / padding */
+    #     __u8 len8_dlc; /* optional DLC for 8 byte payload length (9 .. 15) */
+    #     __u8 data[CAN_MAX_DLEN] __attribute__((aligned(8)));
+    # };
+    return struct.pack("IBss", can_id, len(data), b'\x00'*3, data.ljust(8, b'\x00'))
 
 class Decoder(srd.Decoder):
     api_version = 3
@@ -44,6 +65,10 @@ class Decoder(srd.Decoder):
         {'id': 'nominal_bitrate', 'desc': 'Nominal bitrate (bits/s)', 'default': 1000000},
         {'id': 'fast_bitrate', 'desc': 'Fast bitrate (bits/s)', 'default': 2000000},
         {'id': 'sample_point', 'desc': 'Sample point (%)', 'default': 70.0},
+        {'id': 'socket', 'desc': 'Send data over socketcan socket', 'default': 'none', 'values': (
+            'none', 'vcan0', 'vcan1', 'vcan2', 'vcan3', 'vcan4', 'vcan5', 'vcan6', 'vcan7'
+        )},
+        {'id': 'silent', 'desc': 'Be silent, might be necessary for sigrok-cli', 'default': 'no', 'values': ('yes', 'no')},
     )
     annotations = (
         ('data', 'Payload data'),
@@ -70,9 +95,25 @@ class Decoder(srd.Decoder):
         ('fields', 'Fields', tuple(range(15))),
         ('warnings', 'Warnings', (16,)),
     )
+    binary = (
+        ('data', 'Data'),
+        ('ascii', 'Ascii data'),
+    )
 
     def __init__(self):
         self.reset()
+
+    def get_socket(self):
+        if self.options['socket'] == 'none':
+            raise Exception("No socket selected")
+        if self.socket != None:
+            return self.socket
+        self.socket = socket.socket(socket.PF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
+        if self.socket == -1:
+            self.socket = None
+            raise OSError("Cannot open socket")
+        self.socket.bind((self.options['socket'],))
+        return self.socket
 
     def reset(self):
         self.samplerate = None
@@ -81,6 +122,7 @@ class Decoder(srd.Decoder):
     def start(self):
         self.out_ann = self.register(srd.OUTPUT_ANN)
         self.out_python = self.register(srd.OUTPUT_PYTHON)
+        self.out_binary = self.register(srd.OUTPUT_BINARY)
 
     def set_bit_rate(self, bitrate):
         self.bit_width = float(self.samplerate) / float(bitrate)
@@ -100,6 +142,8 @@ class Decoder(srd.Decoder):
 
     # Generic helper for CAN bit annotations.
     def putg(self, ss, es, data):
+        if self.options['silent'] == 'yes':
+            return
         left, right = int(self.sample_point), int(self.bit_width - self.sample_point)
         self.put(ss - left, es + right, self.out_ann, data)
 
@@ -137,6 +181,7 @@ class Decoder(srd.Decoder):
         self.rtr_type = None
         self.fd = False
         self.rtr = None
+        self.socket = None
 
     # Poor man's clock synchronization. Use signal edges which change to
     # dominant state in rather simple ways. This naive approach is neither
@@ -310,6 +355,7 @@ class Decoder(srd.Decoder):
         # The bits within a data byte are transferred MSB-first.
         elif bitnum == self.last_databit:
             self.ss_databytebits.append(self.samplenum) # Last databyte bit.
+            data = []
             for i in range(dlc2len(self.dlc)):
                 x = self.dlc_start + 4 + (8 * i)
                 b = bitpack_msb(self.bits[x:x + 8])
@@ -318,7 +364,17 @@ class Decoder(srd.Decoder):
                 es = self.ss_databytebits[((i + 1) * 8) - 1]
                 self.putg(ss, es, [0, ['Data byte %d: 0x%02x' % (i, b),
                                        'DB %d: 0x%02x' % (i, b), 'DB']])
+                data.append(b)
             self.ss_databytebits = []
+
+            if self.dlc != len(data):
+                print("Mismatch, not outputting to prevent issues")
+            else:
+                if self.options['silent'] == 'no':
+                    self.put(self.samplenum - 1, self.samplenum, self.out_binary, [1, ('t' + ('0'*3 + hex(self.id)[2:])[-3:] + hex(self.dlc[-1:]) + ''.join([hex(x)[2:] for x in data]) + '\r').encode()])
+
+                if self.options['socket'] != 'none':
+                    self.get_socket().send(build_can_frame(self.id, bytes(data)))
 
         elif bitnum > self.last_databit:
             return self.decode_frame_end(can_rx, bitnum)
@@ -410,6 +466,7 @@ class Decoder(srd.Decoder):
         # The bits within a data byte are transferred MSB-first.
         elif bitnum == self.last_databit:
             self.ss_databytebits.append(self.samplenum) # Last databyte bit.
+            data = []
             for i in range(dlc2len(self.dlc)):
                 x = self.dlc_start + 4 + (8 * i)
                 b = bitpack_msb(self.bits[x:x + 8])
@@ -418,7 +475,17 @@ class Decoder(srd.Decoder):
                 es = self.ss_databytebits[((i + 1) * 8) - 1]
                 self.putg(ss, es, [0, ['Data byte %d: 0x%02x' % (i, b),
                                        'DB %d: 0x%02x' % (i, b), 'DB']])
+                data.append(b)
             self.ss_databytebits = []
+
+            if self.dlc != len(data):
+                print("Mismatch, not outputting to prevent issues")
+            else:
+                if self.options['silent'] == 'no':
+                    self.put(self.samplenum - 1, self.samplenum, self.out_binary, [1, ('T' + ('0'*8 + hex(self.fullid)[2:])[-8:] + hex(self.dlc)[-1:] + ''.join([hex(x)[2:] for x in data]) + '\r').encode()])
+
+                if self.options['socket'] != 'none':
+                    self.get_socket().send(build_can_frame(self.fullid, bytes(data)))
 
         elif bitnum > self.last_databit:
             return self.decode_frame_end(can_rx, bitnum)
@@ -437,6 +504,9 @@ class Decoder(srd.Decoder):
                     or bitnum == 35 and self.frame_type == 'extended':
                 self.dom_edge_seen(force=True)
                 self.set_fast_bitrate()
+
+        if len(self.rawbits) % 8 == 0 and len(self.rawbits) >= 8:
+            self.put(self.samplenum - 8, self.samplenum, self.out_binary, [0, bytes([int(''.join(map(lambda x: str(x), self.rawbits[-8:])), 2)])])
 
         # If this is a stuff bit, remove it from self.bits and ignore it.
         if self.is_stuff_bit():
